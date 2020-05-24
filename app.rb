@@ -1,9 +1,9 @@
+require 'logger'
 require 'bundler'
 Bundler.setup
 
-require 'logger'
-
 require 'sinatra'
+require 'sinatra/flash'
 require 'sequel'
 require 'dry/schema'
 require 'dry/monads/all'
@@ -12,6 +12,8 @@ require 'bcrypt'
 require 'uuid'
 require "rack/csrf"
 
+
+include Dry::Monads[:result, :maybe]
 
 def logger
   @logger ||= Logger.new(STDOUT)
@@ -30,6 +32,10 @@ end
 configure :test do
   logger.info("Running in test environment")
   DB = Sequel.sqlite
+
+  def logger
+    @logger ||= Logger.new('/dev/null')
+  end
 end
 
 configure :production do
@@ -48,14 +54,20 @@ DB.create_table :users do
 end unless DB.table_exists?(:users)
 
 # models
-class User
-  attr_reader :user_id, :username, :email, :password
+module Model
+  class User
+    attr_reader :user_id, :username, :email, :password
 
-  def initialize(opts)
-    @user_id = opts[:user_id]
-    @username = opts[:username]
-    @email = opts[:email]
-    @password = opts[:password]
+    def initialize(opts)
+      @user_id = opts[:user_id]
+      @username = opts[:username]
+      @email = opts[:email]
+      @password = opts[:password]
+    end
+
+    def ==(other)
+      @user_id == other.user_id && @username == other.username && @email == other.email
+    end
   end
 end
 
@@ -63,8 +75,6 @@ end
 # forms
 module Form
   class RegisterUser
-    include Dry::Monads[:result]
-
     RegisterUserSchema =  Dry::Schema.Params do
       required(:username) { filled? & size?(5..100) }
       required(:email) { filled? & size?(1..100) & format?(/.*@.*/) }
@@ -90,6 +100,22 @@ module Form
       end
     end
   end
+
+  class LoginUser
+    LoginUserSchema = Dry::Schema.Params do
+      required(:password) { filled? }
+      required(:email) { filled? }
+    end
+
+    def call(params)
+      errors = LoginUserSchema.(params).errors(full:true).to_h
+      if errors.empty?
+        Success(params)
+      else
+        Failure([:login_invalid, errors])
+      end
+    end
+  end
 end
 
 # repos
@@ -100,10 +126,29 @@ module Repo
     end
     
     def create(user)
-      @db[:users].insert(user_id: user.user_id, username: user.username, email: user.email, password: user.password)
+      id = @db[:users].insert(user_id: user.user_id, username: user.username, email: user.email, password: user.password)
+      Success(id)
+    rescue => e 
+      logger.warn(e)
+      Failure(:server_error)
     end
 
     def find(user_id)
+      record = @db[:users].where(:user_id => user_id).first
+      if record
+        Some(Model::User.new(record))
+      else
+        None()
+      end
+    end
+
+    def find_by_email(email)
+      record = @db[:users].where(email: email).first
+      if record
+        Some(Model::User.new(record))
+      else
+        None()
+      end
     end
   end
 end
@@ -111,29 +156,58 @@ end
 # services
 module Service
   class RegisterUser
-    include Dry::Monads[:result]
-
     def initialize(repo, uuidgen)
       @repo = repo
       @uuidgen = uuidgen
     end
 
     def call(params)
-      password = BCrypt::Password.create(params['password']) 
+      password = BCrypt::Password.create(params['password']) .to_s
       user_id = @uuidgen.generate
-      user = User.new({user_id: user_id, email: params['email'], username: params['username'], password: password})
-      @repo.create(user)
-      Success(user)
-    rescue => e
-      logger.warn(e.message) 
-      Failure(:server_error)
+      user = Model::User.new({user_id: user_id, email: params['email'], username: params['username'], password: password})
+      value = @repo.create(user)
+      case value
+      when Success 
+        Success(user)
+      when Failure 
+        value
+      else
+        raise "Unhandled case"
+      end
+    end
+  end
+
+  class LoginUser
+    def initialize(repo)
+      @repo = repo
+    end
+
+    def call(params)
+      @repo.find_by_email(params['email']).bind do |user|
+        if BCrypt::Password.new(user.password) == params['password']
+          return Success(user)
+        end
+      end
+      Failure('wrong email and password combination')
     end
   end
 end
 
 # sinatra
 
+set(:protected) do |_|
+  condition do
+    unless current_user
+      redirect '/login', 303
+    end
+  end
+end
+
 helpers do
+  def current_user
+    @current_user ||= session[:user_id] && Repo::User.new(DB).find(session[:user_id]).or(nil)
+  end
+
   def errors
     @errors ||= {}
   end
@@ -145,23 +219,27 @@ helpers do
   def csrf_tag
     Rack::Csrf.csrf_tag(env)
   end
+
+  def title(title)
+    @title = title
+  end
 end
 
 get '/register' do
-  @title = 'register'
+  title 'register'
   erb :register
 end
 
 post '/register' do
-  @title = 'register'
+  title 'register'
   form = Form::RegisterUser.new(DB)
   repo = Repo::User.new(DB)
   svc = Service::RegisterUser.new(repo, UUID.new)
   Dry::Matcher::ResultMatcher.(form.(params).bind(-> (params) { svc.call(params) })) do |m|
-    m.success(User) do |_u|
+    m.success(Model::User) do |_|
       redirect '/login', 303
     end
-    m.failure(:registration_invalid) do |_f,  errors|
+    m.failure(:registration_invalid) do |_,  errors|
       @errors = errors
       erb :register
     end
@@ -173,11 +251,40 @@ post '/register' do
 end
 
 get '/login' do
-  @title = 'login'
+  title 'login'
   erb :login
 end
 
 post '/login' do
+  title 'login'
+  form = Form::LoginUser.new()
+  svc = Service::LoginUser.new(Repo::User.new(DB))
+  Dry::Matcher::ResultMatcher.(form.(params).bind(->(params){ svc.call(params) })) do |m|
+    m.success(Model::User) do |user|
+      session[:user_id] = user.user_id
+      flash[:success] = "Welcome back #{user.username}"
+      redirect '/', 303
+    end
+    
+    m.failure(:login_invalid) do |_, errors|
+      @errors = errors
+      erb :login
+    end
+
+    m.failure do |error|
+      @errors = {base: [error]}
+      erb :login
+    end
+
+    m.failure(:server_error) do
+      halt 500, 'Server Error'
+    end
+  end
+end
+
+get '/', :protected => true do
+  title "dashboard"
+  erb :dashboard
 end
 
 
@@ -198,6 +305,13 @@ __END__
 </head>
 <body>
   <div class="container">
+
+    <% flash.keys.each do |type| %>
+      <div class="flash flash-<%= type %>">
+        <%= flash[type] %>
+      </div>
+    <% end %>
+
     <%= yield %>
   </div>
 </body>
@@ -205,7 +319,13 @@ __END__
 
 @@register
 <h2>Register</h2>
-<%= errors.inspect %>
+<ul class="errors">
+<% errors.each do |key, messages| %>
+  <% messages.each do |msg| %>
+  <li><%= msg.capitalize %></li>
+  <% end %>
+<% end %>
+</ul>
 <form method="post" action="/register">
   <%= csrf_tag %>
   <div class="row">
@@ -228,17 +348,27 @@ __END__
 
 @@login
 <h2>Login</h2>
+<ul class="errors">
+<% errors.each do |key, messages| %>
+  <% messages.each do |msg| %>
+  <li><%= msg.capitalize %></li>
+  <% end %>
+<% end %>
+</ul>
 <form method="post" action="/login">
   <%= csrf_tag %>
   <div class="row">
-    <label for="email">
+    <label for="email">Email</label>
     <input type="text" name="email" id="email" class="u-full-width" />
   </div>
 
   <div class="row">
-    <label for="password">
+    <label for="password">Password</label>
     <input type="password" name="password" id="password" class="u-full-width" />
   </div>
 
   <input type="submit" value="Login" />
 </form>
+
+@@dashboard
+<h2>Dashboard</h2>
