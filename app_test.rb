@@ -273,19 +273,40 @@ describe 'Integration' do
   include Capybara::DSL
 
   let(:user) { Model::User.new(username: 'tester', email: 'tester@example.com', password: 'password') }
-  let(:register!) {
+
+  def login(user)
+    visit '/login'
+    fill_in('email', with: user.email)
+    fill_in('password', with: user.password)
+    click_button('Login')
+  end
+
+  def logout
+    visit '/logout'
+  end
+
+  def register(user)
     visit '/register'
     fill_in('username', with: user.username)
     fill_in('email', with: user.email)
     fill_in('password', with:user.password)
     click_button('Register')
+  end
+
+  def create_client(params)
+    visit '/clients/new'
+    fill_in('name', with: params[:name])
+    fill_in('callback_url', with: params[:callback_url])
+    click_button('Submit')
+  end
+
+  let(:register!) {
+    register user
   }
+  
   let(:login!) {
     register!
-    visit '/login'
-    fill_in('email', with: user.email)
-    fill_in('password', with: user.password)
-    click_button('Login')
+    login user
   }
 
   before(:each) do 
@@ -403,12 +424,54 @@ describe 'Integration' do
       visit '/'
       click_link("Add new client")
       assert_equal "/clients/new", current_path
+      logout
+    end
+
+    it 'shows clients owned by the current user' do
+      other = Model::User.new({ username: 'other', email: 'other@example.com', password: 'password'})
+      register other
+      login other
+      create_client({ name: 'other client', callback_url: 'https://other.example.com'})
+      logout
+      login!
+      create_client({name: 'client name', callback_url: 'https://example.com'})
+      visit '/'
+      assert page.has_content?('client name'), 'Shows owned clients name'
+      assert page.has_content?('https://example.com'), 'Shows owned clients callback url'
+      assert !page.has_content?('other client'), 'Does not show other clients name'
+      assert !page.has_content?('https://other.example.com'), 'Does not show other clients callback url'
+      logout
+    end
+
+    it 'can delete a client' do
+      login!
+      create_client({name: 'client name', callback_url: 'https://example.com'})
+      click_link("Delete")
+      assert page.has_content?("Client successfully deleted")
+      logout
+    end
+
+    it 'does not allow to delete clients not in ownership' do
+      login!
+      create_client({name: 'client name', callback_url: 'https://example.com'})
+      delete_client_url = page.find("td a")[:href]
+      logout
+      other = Model::User.new({ username: 'other', email: 'other@example.com', password: 'password'})
+      register other
+      login other
+      visit delete_client_url
+      assert page.has_content?("You are not allowed to perform delete on client name"), 'It does not allow to delete clients that are not owned by us'
+      logout
     end
   end
 
   describe "Clients New Page" do
     before(:each) do
       login!
+    end
+
+    after(:each) do
+      logout
     end
 
     it 'has the right fields' do

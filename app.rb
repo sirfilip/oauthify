@@ -175,26 +175,32 @@ module Repo
       })
       Success(user)
     rescue => e 
-      logger.warn(e)
+      logger.error(e)
       Failure(:server_error)
     end
 
     def find(user_id)
       record = @db[:users].where(:user_id => user_id).first
       if record
-        Some(Model::User.new(record))
+        Success(Model::User.new(record))
       else
-        None()
+        Failure(:record_not_found)
       end
+    rescue => e
+      logger.error(e)
+      Failure(:server_error)
     end
 
     def find_by_email(email)
       record = @db[:users].where(email: email).first
       if record
-        Some(Model::User.new(record))
+        Success(Model::User.new(record))
       else
-        None()
+        Failure(:record_not_found)
       end
+    rescue => e
+      logger.error(e)
+      Failure(:server_error)
     end
   end
 
@@ -221,7 +227,37 @@ module Repo
         user_id: client.user_id,
       }))
     rescue => e
-      logger.warn(e)
+      logger.error(e)
+      Failure(:server_error)
+    end
+
+    def owned_by(user)
+      clients = @db[:clients].where(user_id: user.id).map do |row|
+        Model::Client.new(row)
+      end
+      Success(clients)
+    rescue => e
+      logger.error(e)
+      Failure(:server_error)
+    end
+
+    def find(client_id)
+      record = @db[:clients].where(client_id: client_id).first
+      if record 
+        Success(Model::Client.new(record))
+      else
+        Failure(:record_not_found)
+      end
+    rescue => e
+      logger.error(e)
+      Failure(:server_error)
+    end
+
+    def delete(client)
+      @db[:clients].where(id: client.id).delete
+      Success(client)
+    rescue => e
+      logger.error(e)
       Failure(:server_error)
     end
   end
@@ -279,6 +315,21 @@ module Service
   end
 end
 
+
+# authorization
+module Authorization
+  class ClientPolicy
+    def initialize(user, client)
+      @user = user
+      @client = client
+    end
+
+    def delete?
+      @client.user_id == @user.id
+    end
+  end
+end 
+
 # sinatra
 
 set(:protected) do |_|
@@ -309,6 +360,19 @@ helpers do
 
   def title(title)
     @title = title
+  end
+
+  def authorize!(object, method)
+    policy_clazz = Authorization.const_get("#{object.class.name.split("::").last}Policy")  
+    policy = policy_clazz.new(current_user, object)
+    if policy.send(:"#{method}?")
+      Success(object) 
+    else
+      Failure([:access_forbidden, object, method])
+    end
+  rescue => e
+    logger.error(e)
+    Failure(:server_error)
   end
 end
 
@@ -375,10 +439,19 @@ get '/logout' do
   redirect '/login', 303
 end
 
-# TODO show user clients
 get '/', :protected => true do
   title "dashboard"
-  erb :dashboard
+  repo = Repo::Client.new(DB)
+  Dry::Matcher::ResultMatcher.(repo.owned_by(current_user)) do |m|
+    m.success do |clients|
+      @clients = clients
+      erb :dashboard
+    end
+
+    m.failure(:server_error) do |_|
+      halt 500, 'Server Error'
+    end
+  end
 end
 
 get "/clients/new", :protected => true do
@@ -404,6 +477,24 @@ post "/clients", :protected => true do
   end
 end
 
+get "/clients/:id/delete", :protected => true do |id|
+  repo = Repo::Client.new(DB)
+  Dry::Matcher::ResultMatcher.(repo.find(id).bind(->(client) { authorize! client, :delete }).bind(->(client) { repo.delete(client) })) do |m|
+    m.success do |client|
+      flash[:success] = "Client successfully deleted"
+      redirect '/', 303
+    end
+
+    m.failure(:access_forbidden) do |_, client, method|
+      halt 403, "You are not allowed to perform #{method} on #{client.name}"
+    end
+
+    m.failure(:server_error) do |_|
+      halt 500, 'Server Error'
+    end
+  end
+end
+
 
 __END__
 
@@ -417,6 +508,25 @@ __END__
     body {
       background: #fafafa;
       color: #6f6f6f;
+    }
+
+    .flash {
+      border: 1px solid #ccc;
+      padding: 10px;
+    }
+    .flash-success {
+      border-top-color: rgb(204, 204, 204);
+      border-right-color: rgb(204, 204, 204);
+      border-bottom-color: rgb(204, 204, 204);
+      border-left-color: rgb(204, 204, 204);
+      border-color: #090;
+      background: #070;
+      color: #fff;
+    }
+    .flash-warning {
+      border-color: #900;
+      background: #700;
+      color: #fff;
     }
   </style>
 </head>
@@ -490,6 +600,31 @@ __END__
 @@dashboard
 <h2>Dashboard</h2>
 <a href="/clients/new">Add new client</a>
+<% if @clients.any? %>
+  <table class="u-full-width">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Callback URL</th>
+        <th>Client ID</th>
+        <th>Client Secret</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <% @clients.each do |client| %>
+        <tr>
+          <td><%= client.name %></td>
+          <td><%= client.callback_url %></td>
+          <td><%= client.client_id %></td>
+          <td><%= client.client_secret %></td>
+          <td>
+            <a href="/clients/<%= client.client_id %>/delete">Delete</a>
+          </td>
+        </tr>
+      <% end %>
+  </table>
+<% end %>
 
 @@client_new
 <h2>Add New Client</h2>
@@ -509,7 +644,7 @@ __END__
 
   <div class="row">
     <label for="callback_url">Callback URL</label>
-    <input name="callback_url" id="callback_url" class="u-full-width" />
+    <input type="text" name="callback_url" id="callback_url" class="u-full-width" />
   </div>
 
   <input type="submit" value="Submit" />
