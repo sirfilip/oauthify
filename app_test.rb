@@ -184,6 +184,27 @@ describe 'Project' do
     end
   end
 
+  describe Form::CreateClient do
+    it 'returns the right error messages' do
+      form = Form::CreateClient.new
+      tests = [
+        {
+          name: '',
+          callback_url: '',
+          errors: {
+            name: ['name must be filled'],
+            callback_url: ['callback_url must be filled'],
+          },
+        },
+      ]
+      tests.each do |test|
+        failure = form.({'name' => test[:name], 'callback_url' => test[:callback_url]}).failure
+        assert_equal :invalid_client, failure[0], "Has the right failure"
+        assert_equal test[:errors], failure[1], "Returns the correct errors"
+      end
+    end
+  end
+
   describe Service::RegisterUser  do
     it 'creates user' do
       repo = Repo::User.new(DB)
@@ -228,12 +249,44 @@ describe 'Project' do
       assert user == res.value!, "Got the registered user"
     end
   end
+
+  describe Service::CreateClient do
+    it 'creates client' do
+      svc = Service::CreateClient.new(Repo::Client.new(DB), UUID.new)
+      result = svc.({
+        'name' => 'client_name',
+        'callback_url' => 'https://example.com',
+        'user_id' => 1,
+      })
+      assert result.success?, "Result is successful"
+      client = result.value!
+      assert !client.id.nil?, "id is generated"
+      assert !client.client_id.nil?, "client id is generated"
+      assert !client.client_secret.nil?, "client secret is present"
+    end
+  end
 end
 
 # integration
 Capybara.app = Sinatra::Application
 describe 'Integration' do
   include Capybara::DSL
+
+  let(:user) { Model::User.new(username: 'tester', email: 'tester@example.com', password: 'password') }
+  let(:register!) {
+    visit '/register'
+    fill_in('username', with: user.username)
+    fill_in('email', with: user.email)
+    fill_in('password', with:user.password)
+    click_button('Register')
+  }
+  let(:login!) {
+    register!
+    visit '/login'
+    fill_in('email', with: user.email)
+    fill_in('password', with: user.password)
+    click_button('Login')
+  }
 
   before(:each) do 
     DatabaseCleaner[:sequel].start 
@@ -255,9 +308,9 @@ describe 'Integration' do
     describe 'valid registration' do
       it 'creates user' do
         visit '/register'
-        fill_in('username', with: 'username')
-        fill_in('email', with: 'valid_email@example.com')
-        fill_in('password', with: 'password')
+        fill_in('username', with: user.username)
+        fill_in('email', with: user.email)
+        fill_in('password', with: user.password)
         click_button('Register')
 
         assert_equal '/login', current_path
@@ -316,22 +369,84 @@ describe 'Integration' do
     end
 
     describe 'valid login' do
-      let(:user) { { username: 'tester', email: 'tester@example.com', password: 'password' } }
-      before(:each) do
-        visit '/register'
-        fill_in('username', with: user[:username])
-        fill_in('email', with: user[:email])
-        fill_in('password', with: user[:password])
-        click_button('Register')
-      end
-
       it 'redirects to dashboard' do
-        fill_in('email', with: user[:email])
-        fill_in('password', with: user[:password])
+        register!
+        fill_in('email', with: user.email)
+        fill_in('password', with: user.password)
         click_button('Login')
         assert_equal '/', current_path, "Navigates to home page"
-        assert page.has_content?("Welcome back #{user[:username]}"), "Welcomes the logged in user"
+        assert page.has_content?("Welcome back #{user.username}"), "Welcomes the logged in user"
       end
+    end
+  end
+
+  describe 'Logout' do
+    it 'logs user out' do
+      login!
+      visit '/logout'
+      assert '/login', current_path
+      assert page.has_content?('Logged out successfully!')
+      visit '/'
+      assert '/login', current_path
+      assert page.has_content?('Members only')
+    end
+  end
+
+  describe 'Dashboard Page' do
+    it 'is protected' do
+      visit '/'
+      assert_equal '/login', current_path
+    end
+
+    it 'shows a link to add new client' do
+      login!
+      visit '/'
+      click_link("Add new client")
+      assert_equal "/clients/new", current_path
+    end
+  end
+
+  describe "Clients New Page" do
+    before(:each) do
+      login!
+    end
+
+    it 'has the right fields' do
+      visit '/clients/new'
+      assert page.has_css?('input[name=name]')
+      assert page.has_css?('input[name=callback_url]')
+    end
+
+    it 'shows the correct errors' do
+      visit '/clients/new'
+      tests = [
+        {
+          name: '',
+          callback_url: '',
+          errors: [
+            'Name must be filled',
+            'Callback_url must be filled',
+          ],
+        },
+      ]
+
+      tests.each do |test|
+        fill_in('name', with: test[:name])
+        fill_in('callback_url', with: test[:callback_url])
+        click_button('Submit')
+        test[:errors].each do |err|
+          assert page.has_content?(err), "Shows the right error message: #{err}"
+        end
+      end
+    end
+
+    it 'creates client' do 
+      visit '/clients/new'
+      fill_in('name', with: 'Test Client')
+      fill_in('callback_url', with: 'https://example.com')
+      click_button('Submit')
+      assert_equal '/', current_path, "Redirected to dasboard"
+      assert page.has_content?("Client successfully created")
     end
   end
 end

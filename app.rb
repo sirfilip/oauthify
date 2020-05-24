@@ -53,12 +53,22 @@ DB.create_table :users do
   String :password
 end unless DB.table_exists?(:users)
 
+DB.create_table :clients do
+  primary_key :id
+  String :client_id, null: false, unique: true
+  String :client_secret, null: false, unique: true
+  String :name, null: false
+  String :callback_url, null: false
+  Integer :user_id, null: false
+end unless DB.table_exists?(:clients)
+
 # models
 module Model
   class User
-    attr_reader :user_id, :username, :email, :password
+    attr_reader :id, :user_id, :username, :email, :password
 
     def initialize(opts)
+      @id = opts[:id]
       @user_id = opts[:user_id]
       @username = opts[:username]
       @email = opts[:email]
@@ -66,7 +76,20 @@ module Model
     end
 
     def ==(other)
-      @user_id == other.user_id && @username == other.username && @email == other.email
+      @id = other.id && @user_id == other.user_id && @username == other.username && @email == other.email
+    end
+  end
+
+  class Client
+    attr_reader :id, :client_id, :client_secret, :name, :callback_url, :user_id
+
+    def initialize(opts)
+      @id = opts[:id]
+      @client_id = opts[:client_id]
+      @client_secret = opts[:client_secret]
+      @name = opts[:name]
+      @callback_url = opts[:callback_url]
+      @user_id = opts[:user_id]
     end
   end
 end
@@ -116,6 +139,22 @@ module Form
       end
     end
   end
+
+  class CreateClient
+    CreateClientSchema = Dry::Schema.Params do
+      required(:name) { filled? }
+      required(:callback_url) { filled? }
+    end
+
+    def call(params)
+      errors = CreateClientSchema.(params).errors(full: true).to_h
+      if errors.empty?
+        Success(params)
+      else
+        Failure([:invalid_client, errors])
+      end
+    end
+  end
 end
 
 # repos
@@ -127,7 +166,14 @@ module Repo
     
     def create(user)
       id = @db[:users].insert(user_id: user.user_id, username: user.username, email: user.email, password: user.password)
-      Success(id)
+      user = Model::User.new({
+        id: id,
+        user_id: user.user_id,
+        username: user.username,
+        email: user.email,
+        password: user.password,
+      })
+      Success(user)
     rescue => e 
       logger.warn(e)
       Failure(:server_error)
@@ -151,6 +197,34 @@ module Repo
       end
     end
   end
+
+  class Client
+
+    def initialize(db)
+      @db = db
+    end
+
+    def create(client)
+      id = @db[:clients].insert({
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        name: client.name,
+        callback_url: client.callback_url,
+        user_id: client.user_id,
+      })
+      Success(Model::Client.new({
+        id: id,
+        client_id: client.client_id,
+        client_secret: client.client_secret,
+        name: client.name,
+        callback_url: client.callback_url,
+        user_id: client.user_id,
+      }))
+    rescue => e
+      logger.warn(e)
+      Failure(:server_error)
+    end
+  end
 end
 
 # services
@@ -165,15 +239,7 @@ module Service
       password = BCrypt::Password.create(params['password']) .to_s
       user_id = @uuidgen.generate
       user = Model::User.new({user_id: user_id, email: params['email'], username: params['username'], password: password})
-      value = @repo.create(user)
-      case value
-      when Success 
-        Success(user)
-      when Failure 
-        value
-      else
-        raise "Unhandled case"
-      end
+      @repo.create(user)
     end
   end
 
@@ -191,6 +257,26 @@ module Service
       Failure('wrong email and password combination')
     end
   end
+
+  class CreateClient
+    def initialize(repo, uuidgen)
+      @repo = repo
+      @uuidgen = uuidgen
+    end
+
+    def call(params)
+      client_id = @uuidgen.generate
+      client_secret = @uuidgen.generate
+      client = Model::Client.new({
+        client_id: client_id,
+        client_secret: client_secret,
+        name: params['name'],
+        callback_url: params['callback_url'],
+        user_id: params['user_id'],
+      })
+      @repo.create(client)
+    end
+  end
 end
 
 # sinatra
@@ -198,6 +284,7 @@ end
 set(:protected) do |_|
   condition do
     unless current_user
+      flash[:warning] = 'Members only'
       redirect '/login', 303
     end
   end
@@ -205,7 +292,7 @@ end
 
 helpers do
   def current_user
-    @current_user ||= session[:user_id] && Repo::User.new(DB).find(session[:user_id]).or(nil)
+    @current_user ||= session[:user_id] && Repo::User.new(DB).find(session[:user_id]).value_or(nil)
   end
 
   def errors
@@ -282,9 +369,39 @@ post '/login' do
   end
 end
 
+get '/logout' do
+  session[:user_id] = nil
+  flash[:success] = "Logged out successfully!"
+  redirect '/login', 303
+end
+
+# TODO show user clients
 get '/', :protected => true do
   title "dashboard"
   erb :dashboard
+end
+
+get "/clients/new", :protected => true do
+  title "add-new-client"
+  erb :client_new
+end
+
+post "/clients", :protected => true do
+  title "add-new-client"
+  form = Form::CreateClient.new
+  svc = Service::CreateClient.new(Repo::Client.new(DB), UUID.new)
+  params['user_id'] = current_user.id
+  Dry::Matcher::ResultMatcher.(form.(params).bind(->(params) { svc.(params) })) do |m|
+    m.success(Model::Client) do |_| 
+      flash[:success] = "Client successfully created"
+      redirect '/', 303
+    end
+
+    m.failure(:invalid_client) do |_, errors|
+      @errors = errors
+      erb :client_new
+    end
+  end
 end
 
 
@@ -372,3 +489,28 @@ __END__
 
 @@dashboard
 <h2>Dashboard</h2>
+<a href="/clients/new">Add new client</a>
+
+@@client_new
+<h2>Add New Client</h2>
+<ul class="errors">
+<% errors.each do |key, messages| %>
+  <% messages.each do |msg| %>
+  <li><%= msg.capitalize %></li>
+  <% end %>
+<% end %>
+</ul>
+<form method="post" action="/clients">
+  <%= csrf_tag %>
+  <div class="row">
+    <label for="name">Name</label>
+    <input type="text" name="name" id="name" class="u-full-width" />
+  </div>
+
+  <div class="row">
+    <label for="callback_url">Callback URL</label>
+    <input name="callback_url" id="callback_url" class="u-full-width" />
+  </div>
+
+  <input type="submit" value="Submit" />
+</form>
