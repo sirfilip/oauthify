@@ -190,15 +190,15 @@ describe 'Project' do
       tests = [
         {
           name: '',
-          callback_url: '',
+          redirect_url: '',
           errors: {
             name: ['name must be filled'],
-            callback_url: ['callback_url must be filled'],
+            redirect_url: ['redirect_url must be filled'],
           },
         },
       ]
       tests.each do |test|
-        failure = form.({'name' => test[:name], 'callback_url' => test[:callback_url]}).failure
+        failure = form.({'name' => test[:name], 'redirect_url' => test[:redirect_url]}).failure
         assert_equal :invalid_client, failure[0], "Has the right failure"
         assert_equal test[:errors], failure[1], "Returns the correct errors"
       end
@@ -255,7 +255,7 @@ describe 'Project' do
       svc = Service::CreateClient.new(Repo::Client.new(DB), UUID.new)
       result = svc.({
         'name' => 'client_name',
-        'callback_url' => 'https://example.com',
+        'redirect_url' => 'https://example.com',
         'user_id' => 1,
       })
       assert result.success?, "Result is successful"
@@ -296,7 +296,7 @@ describe 'Integration' do
   def create_client(params)
     visit '/clients/new'
     fill_in('name', with: params[:name])
-    fill_in('callback_url', with: params[:callback_url])
+    fill_in('redirect_url', with: params[:redirect_url])
     click_button('Submit')
   end
 
@@ -431,10 +431,10 @@ describe 'Integration' do
       other = Model::User.new({ username: 'other', email: 'other@example.com', password: 'password'})
       register other
       login other
-      create_client({ name: 'other client', callback_url: 'https://other.example.com'})
+      create_client({ name: 'other client', redirect_url: 'https://other.example.com'})
       logout
       login!
-      create_client({name: 'client name', callback_url: 'https://example.com'})
+      create_client({name: 'client name', redirect_url: 'https://example.com'})
       visit '/'
       assert page.has_content?('client name'), 'Shows owned clients name'
       assert page.has_content?('https://example.com'), 'Shows owned clients callback url'
@@ -445,7 +445,7 @@ describe 'Integration' do
 
     it 'can delete a client' do
       login!
-      create_client({name: 'client name', callback_url: 'https://example.com'})
+      create_client({name: 'client name', redirect_url: 'https://example.com'})
       click_link("Delete")
       assert page.has_content?("Client successfully deleted")
       logout
@@ -453,7 +453,7 @@ describe 'Integration' do
 
     it 'does not allow to delete clients not in ownership' do
       login!
-      create_client({name: 'client name', callback_url: 'https://example.com'})
+      create_client({name: 'client name', redirect_url: 'https://example.com'})
       delete_client_url = page.find("td a")[:href]
       logout
       other = Model::User.new({ username: 'other', email: 'other@example.com', password: 'password'})
@@ -477,7 +477,7 @@ describe 'Integration' do
     it 'has the right fields' do
       visit '/clients/new'
       assert page.has_css?('input[name=name]')
-      assert page.has_css?('input[name=callback_url]')
+      assert page.has_css?('input[name=redirect_url]')
     end
 
     it 'shows the correct errors' do
@@ -485,17 +485,17 @@ describe 'Integration' do
       tests = [
         {
           name: '',
-          callback_url: '',
+          redirect_url: '',
           errors: [
             'Name must be filled',
-            'Callback_url must be filled',
+            'Redirect_url must be filled',
           ],
         },
       ]
 
       tests.each do |test|
         fill_in('name', with: test[:name])
-        fill_in('callback_url', with: test[:callback_url])
+        fill_in('redirect_url', with: test[:redirect_url])
         click_button('Submit')
         test[:errors].each do |err|
           assert page.has_content?(err), "Shows the right error message: #{err}"
@@ -506,7 +506,7 @@ describe 'Integration' do
     it 'creates client' do 
       visit '/clients/new'
       fill_in('name', with: 'Test Client')
-      fill_in('callback_url', with: 'https://example.com')
+      fill_in('redirect_url', with: 'https://example.com')
       click_button('Submit')
       assert_equal '/', current_path, "Redirected to dasboard"
       assert page.has_content?("Client successfully created")
